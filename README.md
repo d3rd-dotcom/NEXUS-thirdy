@@ -1,10 +1,10 @@
-# NEXUS
+# NEXUSi-thirdy
 
 > Server-native AI agent. Built from scratch. Deployed on Koyeb. No laptop required.
 
 ---
 
-## What NEXUS is
+## What NEXUS-thirdy is
 
 NEXUS is a production-grade AI agent with:
 - **LangGraph** orchestration with crash recovery
