@@ -1,4 +1,4 @@
-# NEXUS-thirdy
+# NEXUS
 
 > Server-native AI agent. Built from scratch. Deployed on Koyeb. No laptop required.
 
