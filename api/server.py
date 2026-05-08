@@ -27,7 +27,7 @@ START_TIME = time.time()
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     """
     Koyeb pings this every 30 seconds.
