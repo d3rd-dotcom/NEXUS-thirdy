@@ -1,14 +1,15 @@
 """
 NEXUS-thirdy | platforms/pinai.py
-Phase 5 — PIN AI Connection (Corrected)
+Phase 5 — PIN AI Connection (Fixed)
 
-Uses the official PIN AI SDK API endpoints:
-  POST /api/sdk/poll_messages   ← fetch unread messages
-  POST /api/sdk/reply_message   ← send a reply
-Auth header: x-api-key (not Bearer)
+Uses the confirmed working AgentHub endpoints:
+  POST /api/heartbeat     ← keeps agent online
+  GET  /api/messages      ← fetch inbox
+  GET  /api/messages/:id  ← fetch messages from a peer
+  POST /api/message       ← send a reply
 
-Runs as a background asyncio task — no separate process, no CMD window.
-Starts automatically when FastAPI server starts.
+Auth: Authorization: Bearer YOUR_API_KEY
+Base URL: https://agents.pinai.tech
 """
 
 import asyncio
@@ -19,112 +20,81 @@ import structlog
 
 log = structlog.get_logger()
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-
 HEADERS = {
-    "x-api-key": settings.PINAI_API_KEY,
+    "Authorization": f"Bearer {settings.PINAI_API_KEY}",
     "Content-Type": "application/json"
 }
 
-POLL_INTERVAL = 5        # seconds between polls
-HEARTBEAT_EVERY = 6      # send heartbeat every N polls (~30 seconds)
+POLL_INTERVAL = 5
+HEARTBEAT_EVERY = 6
 
-# Tracks last seen timestamp to avoid reprocessing old messages
-_last_timestamp: int = 0
-
-# Tracks sessions already greeted
-_greeted_sessions: set[str] = set()
+_replied_ids: set = set()
+_greeted_ids: set = set()
 
 
 # ── API CALLS ─────────────────────────────────────────────────────────────────
 
-async def poll_messages() -> list[dict]:
-    """
-    Fetch unread messages for NEXUS-thirdy since last poll.
-    Uses PIN AI's poll_messages endpoint.
-    """
-    global _last_timestamp
-
+async def send_heartbeat() -> None:
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             r = await client.post(
-                f"{settings.PINAI_API_URL}/api/sdk/poll_messages",
+                f"{settings.PINAI_API_URL}/api/heartbeat",
                 headers=HEADERS,
-                json={
-                    "agent_id": (settings.PINAI_AGENT_ID),
-                    "since_timestamp": _last_timestamp,
-                    "sender": "user"   # Only fetch user messages, not our own replies
-                }
+                json={"supports_chat": True}
             )
-            if r.status_code == 200:
-                messages = r.json()
-                if messages:
-                    # Update timestamp to latest message so we don't re-fetch
-                    _last_timestamp = max(m.get("timestamp", 0) for m in messages)
-                return messages
-            else:
-                log.warning("pinai_poll_error", status=r.status_code, body=r.text[:200])
-                return []
+            log.info("pinai_heartbeat", status=r.status_code)
     except Exception as e:
-        log.error("pinai_poll_failed", error=str(e))
-        return []
+        log.warning("pinai_heartbeat_failed", error=str(e))
 
 
-async def reply_message(session_id: str, persona_id: int, content: str) -> bool:
-    """
-    Send a reply to a user in a specific session.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{settings.PINAI_API_URL}/api/sdk/reply_message",
-                headers=HEADERS,
-                json={
-                    "agent_id": (settings.PINAI_AGENT_ID),
-                    "persona_id": persona_id,
-                    "content": content,
-                    "media_type": None,
-                    "media_url": None,
-                    "meta_data": {}
-                },
-                params={"session_id": session_id}
-            )
-            if r.status_code == 200:
-                return True
-            log.warning("pinai_reply_error", status=r.status_code, body=r.text[:200])
-            return False
-    except Exception as e:
-        log.error("pinai_reply_failed", session=session_id, error=str(e))
-        return False
-
-
-async def get_persona(session_id: str) -> dict:
-    """
-    Get user persona info for a session.
-    Useful for personalizing responses with user's name.
-    """
+async def get_inbox() -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
-                f"{settings.PINAI_API_URL}/api/sdk/get_persona_by_session",
-                headers=HEADERS,
-                params={"session_id": session_id}
+                f"{settings.PINAI_API_URL}/api/messages",
+                headers=HEADERS
             )
             if r.status_code == 200:
-                return r.json()
-            return {}
+                return r.json().get("conversations", [])
+            log.warning("pinai_inbox_error", status=r.status_code)
+            return []
     except Exception as e:
-        log.error("pinai_persona_failed", error=str(e))
-        return {}
+        log.error("pinai_inbox_failed", error=str(e))
+        return []
+
+
+async def get_messages(peer_id: str) -> list[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{settings.PINAI_API_URL}/api/messages/{peer_id}",
+                headers=HEADERS
+            )
+            if r.status_code == 200:
+                return r.json().get("messages", [])
+            return []
+    except Exception as e:
+        log.error("pinai_get_messages_failed", peer=peer_id, error=str(e))
+        return []
+
+
+async def send_message(to_agent_id: str, content: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{settings.PINAI_API_URL}/api/message",
+                headers=HEADERS,
+                json={"to": to_agent_id, "content": content}
+            )
+            return r.status_code == 200
+    except Exception as e:
+        log.error("pinai_send_failed", to=to_agent_id, error=str(e))
+        return False
 
 
 # ── MESSAGE PROCESSOR ─────────────────────────────────────────────────────────
 
 async def process_message(user_id: str, content: str) -> str:
-    """
-    Runs a user message through the full NEXUS-thirdy LangGraph.
-    Returns the agent's response string.
-    """
     initial_state = {
         "user_id": user_id,
         "platform": "pinai",
@@ -137,7 +107,6 @@ async def process_message(user_id: str, content: str) -> str:
         "final_response": "",
         "messages": []
     }
-
     try:
         final_state = await nexus_graph.ainvoke(initial_state)
         response = final_state.get("final_response", "")
@@ -150,59 +119,69 @@ async def process_message(user_id: str, content: str) -> str:
 # ── POLLING LOOP ──────────────────────────────────────────────────────────────
 
 async def pinai_polling_loop():
-    """
-    Main polling loop.
-    Runs forever as a background asyncio task inside FastAPI.
-    Starts automatically on server startup via lifespan.
-    """
-
     if not settings.has_pinai():
-        log.warning(
-            "pinai_disabled",
-            reason="PINAI_API_KEY or PINAI_AGENT_ID not set — skipping PIN AI connection"
-        )
+        log.warning("pinai_disabled", reason="PINAI_API_KEY or PINAI_AGENT_ID not set")
         return
 
     log.info("pinai_polling_started", agent_id=settings.PINAI_AGENT_ID)
 
+    # Send heartbeat immediately on startup
+    await send_heartbeat()
     poll_count = 0
 
     while True:
         try:
             poll_count += 1
 
-            # Poll for new messages
-            messages = await poll_messages()
+            # Heartbeat every 30 seconds
+            if poll_count % HEARTBEAT_EVERY == 0:
+                await send_heartbeat()
 
-            for msg in messages:
-                session_id = msg.get("session_id")
-                content = msg.get("content", "").strip()
-                persona_id = msg.get("persona_id") or msg.get("id")
+            # Fetch inbox
+            conversations = await get_inbox()
 
-                if not session_id or not content:
+            for conv in conversations:
+                peer = conv.get("peer", {})
+                peer_id = peer.get("id")
+                unread = conv.get("unread_count", 0)
+
+                if not peer_id or unread == 0:
                     continue
 
-                # Use session_id as user_id for memory scoping
-                user_id = session_id
-
-                # Send greeting to new sessions
-                if session_id not in _greeted_sessions:
-                    _greeted_sessions.add(session_id)
-                    greeting = await process_message(user_id, "hello")
-                    await reply_message(session_id, persona_id, greeting)
-                    log.info("pinai_greeted", session=session_id)
+                # Greet new users
+                if peer_id not in _greeted_ids:
+                    _greeted_ids.add(peer_id)
+                    greeting = await process_message(peer_id, "hello")
+                    await send_message(peer_id, greeting)
+                    log.info("pinai_greeted", peer=peer_id)
                     continue
 
-                # Process normal message through LangGraph
-                response = await process_message(user_id, content)
-                sent = await reply_message(session_id, persona_id, response)
+                # Fetch unread messages
+                messages = await get_messages(peer_id)
+                for msg in messages:
+                    msg_id = msg.get("id")
+                    from_id = msg.get("from_agent_id", "")
 
-                log.info(
-                    "pinai_replied",
-                    session=session_id,
-                    content_preview=content[:50],
-                    sent=sent
-                )
+                    if not msg_id or msg_id in _replied_ids:
+                        continue
+                    if from_id == settings.PINAI_AGENT_ID:
+                        continue
+
+                    content = msg.get("content", "").strip()
+                    if not content:
+                        continue
+
+                    _replied_ids.add(msg_id)
+
+                    response = await process_message(peer_id, content)
+                    sent = await send_message(peer_id, response)
+
+                    log.info(
+                        "pinai_replied",
+                        peer=peer_id,
+                        msg_id=msg_id,
+                        sent=sent
+                    )
 
         except Exception as e:
             log.error("pinai_loop_error", error=str(e))
