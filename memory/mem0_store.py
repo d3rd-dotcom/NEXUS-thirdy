@@ -26,7 +26,7 @@ def _build_mem0_config() -> dict:
             "config": {
                 "collection_name": "nexus_memories",
                 "dbname": "postgres",
-                "user": "postgres.YOUR_PROJECT_REF",   # Replace with your Supabase project ref
+                "user": "postgres.wmavdqyjkbbrocnagegd",
                 "password": settings.SUPABASE_SERVICE_KEY,
                 "host": "aws-0-ap-southeast-1.pooler.supabase.com",  # Replace with your Supabase host
                 "port": 5432,
