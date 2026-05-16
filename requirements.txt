@@ -38,3 +38,5 @@ restrictedpython>=7.0.0
 python-dotenv>=1.0.0
 aiohttp>=3.9.0
 structlog>=24.0.0
+
+langchain-openai>=0.3.0
