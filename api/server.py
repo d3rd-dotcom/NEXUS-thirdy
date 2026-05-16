@@ -1,12 +1,12 @@
 """
 NEXUS-thirdy | api/server.py
-Phase 7 — Final Server
+Phase 8 — Security Layer Integrated
 
-Changes from Phase 5:
-  - Added POST /agent endpoint (AgentHub skill calls)
-  - Added x402 payment verification on premium skills
-  - Added GET /wallet endpoint (show agent wallet info)
-  - Cerebras fallback in supervisor for Groq rate limits
+Changes from Phase 7:
+  - Input validation on /chat and /webhook endpoints
+  - Output validation before every response
+  - Security scan integrated via supervisor (not duplicated here)
+  - Behavioral drift logging to Supabase
 """
 
 import time
@@ -23,6 +23,7 @@ from agent.graph import nexus_graph
 from platforms.pinai import pinai_polling_loop
 from payments.x402_middleware import verify_payment, build_payment_required_response
 from payments.wallet import get_wallet_address, get_balance
+from security.validators import validate_input, validate_output, sanitize_user_id
 import structlog
 
 log = structlog.get_logger()
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NEXUS-thirdy",
     description="Server-native AI agent. No laptop required.",
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan
 )
 
@@ -70,10 +71,34 @@ class ChatResponse(BaseModel):
 
 
 class AgentSkillRequest(BaseModel):
-    """AgentHub skill call format."""
     skill: str
     parameters: dict = {}
     request_id: str = ""
+
+
+# ── DRIFT LOGGING ─────────────────────────────────────────────────────────────
+
+async def log_interaction(user_id: str, skill: str, platform: str, success: bool):
+    """
+    Log every interaction to Supabase for behavioral drift monitoring.
+    Non-blocking — fire and forget.
+    Drift analysis runs weekly as a separate script (Phase 10).
+    """
+    if not settings.SUPABASE_URL:
+        return
+
+    try:
+        from supabase import create_client
+        supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+        supabase.table("nexus_interactions").insert({
+            "user_id": user_id,
+            "skill": skill,
+            "platform": platform,
+            "success": success,
+            "timestamp": time.time()
+        }).execute()
+    except Exception as e:
+        log.error("drift_log_failed", error=str(e))
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
@@ -89,14 +114,20 @@ async def status():
     counts = skill_count()
     return {
         "agent": "NEXUS-thirdy",
-        "version": "0.7.0",
-        "phase": "7 - premium skills, reflexion, x402 payments",
+        "version": "0.8.0",
+        "phase": "8 - security layer active",
         "environment": settings.ENVIRONMENT,
         "uptime_seconds": int(time.time() - START_TIME),
         "skills": counts,
         "llm_ready": settings.has_groq(),
         "pinai_ready": settings.has_pinai(),
         "payments_ready": bool(settings.AGENT_WALLET_ADDRESS),
+        "security": {
+            "firewall": settings.LLAMAFIREWALL_ENABLED,
+            "input_validation": True,
+            "output_validation": True,
+            "drift_logging": bool(settings.SUPABASE_URL)
+        },
         "wallet": wallet_address or "not configured",
         "memory_ready": {
             "vector": bool(settings.SUPABASE_URL),
@@ -112,28 +143,27 @@ async def skill_manifest():
 
 @app.get("/wallet")
 async def wallet_info():
-    """Show NEXUS-thirdy's wallet address and balance."""
     address = await get_wallet_address()
     balance = await get_balance()
-    return {
-        "address": address,
-        "balance": balance,
-        "network": settings.X402_NETWORK
-    }
+    return {"address": address, "balance": balance, "network": settings.X402_NETWORK}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Main chat endpoint."""
-    if not req.message or not req.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
-    if len(req.message) > 2000:
-        raise HTTPException(status_code=400, detail="Message too long (max 2000 characters)")
+    """Main chat endpoint with full security layer."""
+
+    # Sanitize user_id
+    user_id = sanitize_user_id(req.user_id)
+
+    # Input validation
+    validation = validate_input(req.message, user_id=user_id)
+    if not validation.is_valid:
+        raise HTTPException(status_code=400, detail=validation.reason)
 
     initial_state = {
-        "user_id": req.user_id,
+        "user_id": user_id,
         "platform": req.platform,
-        "raw_message": req.message.strip(),
+        "raw_message": validation.sanitized or req.message.strip(),
         "detected_skill": "",
         "requires_payment": False,
         "payment_verified": False,
@@ -151,15 +181,27 @@ async def chat(req: ChatRequest):
     try:
         final_state = await nexus_graph.ainvoke(initial_state)
     except Exception as e:
-        log.error("graph_error", user_id=req.user_id, error=str(e))
+        log.error("graph_error", user_id=user_id, error=str(e))
+        asyncio.create_task(log_interaction(user_id, "error", req.platform, False))
         raise HTTPException(status_code=500, detail="Agent processing error")
 
     skill_used = final_state.get("detected_skill", "unknown")
+    raw_response = final_state.get("final_response", "")
+
+    # Output validation
+    output_validation = validate_output(raw_response, skill_id=skill_used)
+    final_response = output_validation.sanitized or raw_response
+
+    # Log interaction for drift monitoring
+    asyncio.create_task(
+        log_interaction(user_id, skill_used, req.platform, True)
+    )
+
     skill_def = get_skill(skill_used)
     cost = skill_def.price_usdc if skill_def and final_state.get("payment_verified") else 0.0
 
     return ChatResponse(
-        response=final_state.get("final_response", ""),
+        response=final_response,
         skill_used=skill_used,
         cost_usdc=cost
     )
@@ -167,53 +209,42 @@ async def chat(req: ChatRequest):
 
 @app.post("/agent")
 async def agent_skill_call(req: AgentSkillRequest, request: Request):
-    """
-    AgentHub skill call endpoint.
-    AgentHub POSTs here when another agent or user calls a NEXUS-thirdy skill.
-
-    Request format (from AgentHub):
-      {"skill": "chat", "parameters": {"message": "..."}, "request_id": "req_xxx"}
-
-    Response format (expected by AgentHub):
-      {"result": "...", "data": {}}
-    """
+    """AgentHub skill call endpoint."""
     skill_id = req.skill
     parameters = req.parameters
     request_id = req.request_id
 
     log.info("agent_skill_called", skill=skill_id, request_id=request_id)
 
-    # Extract message from parameters
     message = parameters.get("message", parameters.get("query", parameters.get("text", "")))
-    user_id = parameters.get("user_id", f"agenthub_{request_id}")
+    user_id = sanitize_user_id(parameters.get("user_id", f"agenthub_{request_id}"))
 
     if not message:
         return {"result": "No message provided.", "data": {}}
 
-    # Check x402 payment for premium skills
+    # Input validation
+    validation = validate_input(message, user_id=user_id)
+    if not validation.is_valid:
+        return {"result": "Invalid input.", "data": {"reason": validation.reason}}
+
+    # Payment check for premium skills
     skill_def = get_skill(skill_id)
     if skill_def and skill_def.requires_payment:
         payment_proof = request.headers.get("X-Payment", "")
         wallet = await get_wallet_address()
-
         is_paid, reason = await verify_payment(
             skill_id=skill_id,
             payment_proof=payment_proof,
             user_address=user_id
         )
-
         if not is_paid:
             payment_info = build_payment_required_response(skill_id, wallet)
-            return JSONResponse(
-                status_code=402,
-                content=payment_info
-            )
+            return JSONResponse(status_code=402, content=payment_info)
 
-    # Process through LangGraph
     initial_state = {
         "user_id": user_id,
         "platform": "agenthub",
-        "raw_message": message,
+        "raw_message": validation.sanitized or message,
         "detected_skill": skill_id if skill_def else "",
         "requires_payment": bool(skill_def and skill_def.requires_payment),
         "payment_verified": True if (skill_def and not skill_def.requires_payment) else False,
@@ -231,6 +262,11 @@ async def agent_skill_call(req: AgentSkillRequest, request: Request):
     try:
         final_state = await nexus_graph.ainvoke(initial_state)
         result = final_state.get("final_response", "")
+
+        # Output validation
+        output_validation = validate_output(result, skill_id=skill_id)
+        result = output_validation.sanitized or result
+
         return {
             "result": result,
             "data": {

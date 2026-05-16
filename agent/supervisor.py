@@ -1,10 +1,11 @@
 """
 NEXUS-thirdy | agent/supervisor.py
-Phase 3 — Supervisor Node
+Phase 8 — Updated Supervisor with Cerebras Fallback
 
-The router. Runs on every single message.
-Uses Groq 8B (fastest, free) to classify intent and identify which skill to run.
-Keeps it cheap and fast — this node runs before anything else.
+Changes from Phase 3:
+  - Cerebras fallback when Groq hits rate limit (fixes 429 errors in logs)
+  - Security scan on every message before routing
+  - sanitize_user_id applied to all user IDs
 """
 
 import json
@@ -12,17 +13,39 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from config.settings import settings
 from config.skill_registry import SKILL_REGISTRY
+from security.validators import validate_input, sanitize_user_id
+from security.firewall import scan_message
 import structlog
 
 log = structlog.get_logger()
 
-# Groq 8B — fast enough for routing, cheap enough to run on every message
-_supervisor_llm = ChatGroq(
+# Primary — Groq 8B (fast, free)
+_groq_llm = ChatGroq(
     api_key=settings.GROQ_API_KEY,
     model="llama-3.1-8b-instant",
     temperature=0,
     max_tokens=150
 )
+
+# Fallback — Cerebras 70B (when Groq rate limit hit)
+_cerebras_llm = None
+
+def _get_cerebras():
+    global _cerebras_llm
+    if _cerebras_llm is None and settings.CEREBRAS_API_KEY:
+        try:
+            from langchain_openai import ChatOpenAI
+            _cerebras_llm = ChatOpenAI(
+                base_url="https://api.cerebras.ai/v1",
+                api_key=settings.CEREBRAS_API_KEY,
+                model="llama3.1-8b",   # 8B on Cerebras = still fast
+                temperature=0,
+                max_tokens=150
+            )
+        except Exception as e:
+            log.error("cerebras_supervisor_init_failed", error=str(e))
+    return _cerebras_llm
+
 
 SUPERVISOR_PROMPT = """You are NEXUS-thirdy's routing brain.
 Your ONLY job is to read the user's message and pick the best skill to handle it.
@@ -40,43 +63,84 @@ Format: {{"skill": "skill_id", "confidence": 0.95, "language": "en"}}
 """
 
 
+async def _invoke_supervisor(messages: list) -> str:
+    """Try Groq first, fall back to Cerebras on rate limit."""
+    try:
+        result = await _groq_llm.ainvoke(messages)
+        return result.content.strip()
+    except Exception as e:
+        error_str = str(e)
+        if "429" in error_str or "rate_limit" in error_str:
+            log.warning("groq_rate_limit_falling_back_to_cerebras")
+            cerebras = _get_cerebras()
+            if cerebras:
+                try:
+                    result = await cerebras.ainvoke(messages)
+                    return result.content.strip()
+                except Exception as ce:
+                    log.error("cerebras_fallback_failed", error=str(ce))
+        else:
+            log.error("supervisor_llm_error", error=error_str[:200])
+        return ""
+
+
 async def supervisor_node(state: dict) -> dict:
     """
-    Reads the user message, picks a skill, sets detected_skill in state.
-    Also builds the context pack (memory + graph) before routing.
+    Reads the user message, validates it, scans for injection,
+    then picks the best skill to handle it.
     """
-    user_id = state["user_id"]
-    raw_message = state["raw_message"]
+    user_id = sanitize_user_id(state.get("user_id", "anonymous"))
+    state["user_id"] = user_id  # Update with sanitized version
+    raw_message = state.get("raw_message", "")
 
-    # Build context pack from memory (Phase 4 adds real memory here)
-    # For Phase 3: context is empty — memory layer not installed yet
-    context_pack = state.get("context_pack", "No memory context yet.")
-    state["context_pack"] = context_pack
+    # Input validation
+    validation = validate_input(raw_message, user_id=user_id)
+    if not validation.is_valid:
+        state["detected_skill"] = "greet"
+        state["requires_payment"] = False
+        state["final_response"] = "Your message couldn't be processed. Please try rephrasing."
+        log.warning("input_rejected", user_id=user_id, reason=validation.reason)
+        return state
 
-    # Build skill list for the prompt
+    # Security scan
+    is_safe, reason = await scan_message(user_id=user_id, message=raw_message)
+    if not is_safe:
+        state["detected_skill"] = "greet"
+        state["requires_payment"] = False
+        state["final_response"] = "Your message was flagged by our security filter. Please rephrase."
+        return state
+
+    # Use sanitized message
+    raw_message = validation.sanitized or raw_message
+
+    # Build skill list
     skill_list = "\n".join(
         f"  - {skill_id}: {s.description}"
         for skill_id, s in SKILL_REGISTRY.items()
     )
 
+    messages = [
+        SystemMessage(content=SUPERVISOR_PROMPT.format(skill_list=skill_list)),
+        HumanMessage(content=raw_message)
+    ]
+
+    raw_response = await _invoke_supervisor(messages)
+
+    if not raw_response:
+        state["detected_skill"] = "greet"
+        state["requires_payment"] = False
+        return state
+
     try:
-        response = await _supervisor_llm.ainvoke([
-            SystemMessage(content=SUPERVISOR_PROMPT.format(skill_list=skill_list)),
-            HumanMessage(content=raw_message)
-        ])
+        # Strip markdown fences if present
+        if raw_response.startswith("```"):
+            raw_response = raw_response.split("```")[1]
+            if raw_response.startswith("json"):
+                raw_response = raw_response[4:]
 
-        raw = response.content.strip()
-
-        # Strip markdown fences if model adds them anyway
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        routing = json.loads(raw)
+        routing = json.loads(raw_response)
         detected = routing.get("skill", "greet")
 
-        # Validate — if model hallucinates a skill id, fall back to greet
         if detected not in SKILL_REGISTRY:
             detected = "greet"
 
@@ -91,7 +155,7 @@ async def supervisor_node(state: dict) -> dict:
         )
 
     except Exception as e:
-        log.error("supervisor_error", error=str(e), user_id=user_id)
+        log.error("supervisor_parse_error", error=str(e))
         state["detected_skill"] = "greet"
         state["requires_payment"] = False
 
