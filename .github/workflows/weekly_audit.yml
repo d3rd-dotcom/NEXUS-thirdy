@@ -1,0 +1,46 @@
+name: Weekly Self-Audit
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Every Monday at 9:00 AM UTC
+  workflow_dispatch:        # Also allows manual trigger from GitHub Actions tab
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase python-dotenv
+
+      - name: Run weekly audit
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ENVIRONMENT: production
+        run: python scripts/weekly_audit.py
+
+      - name: Check agent health
+        run: |
+          STATUS=$(curl -s https://nexus-thirdy.onrender.com/status)
+          echo "Agent status: $STATUS"
+          echo "$STATUS" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          version = data.get('version', 'unknown')
+          phase = data.get('phase', 'unknown')
+          uptime = data.get('uptime_seconds', 0)
+          print(f'Version: {version}')
+          print(f'Phase: {phase}')
+          print(f'Uptime: {uptime // 3600}h {(uptime % 3600) // 60}m')
+          skills = data.get('skills', {})
+          print(f'Skills: {skills}')
+          "

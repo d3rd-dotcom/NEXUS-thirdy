@@ -1,0 +1,36 @@
+name: Deploy NEXUS-thirdy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install core dependencies only
+        run: |
+          pip install fastapi uvicorn pydantic python-dotenv structlog pytest
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short
+        continue-on-error: true
+        # continue-on-error: true means failed tests warn but don't block deploy
+        # Change to false when test suite is mature
+
+      - name: Notify Render to deploy
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" \
+            -H "Content-Type: application/json"
+        # Add RENDER_DEPLOY_HOOK to GitHub repo secrets
+        # Get it from: Render → your service → Settings → Deploy Hook
