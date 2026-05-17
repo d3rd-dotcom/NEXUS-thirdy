@@ -1,12 +1,13 @@
 """
 NEXUS-thirdy | api/server.py
-Phase 8 — Security Layer Integrated
+Phase 9 — Multi-Platform Server
 
-Changes from Phase 7:
-  - Input validation on /chat and /webhook endpoints
-  - Output validation before every response
-  - Security scan integrated via supervisor (not duplicated here)
-  - Behavioral drift logging to Supabase
+Changes from Phase 8:
+  - Fetch.AI polling loop added to lifespan
+  - Webhook adapter uses platform auto-detection
+  - MCP-compatible /mcp endpoint added
+  - /platforms endpoint shows all connected platforms
+  - Updated version to 0.9.0
 """
 
 import time
@@ -21,6 +22,8 @@ from config.settings import settings
 from config.skill_registry import generate_skill_manifest, skill_count, get_skill
 from agent.graph import nexus_graph
 from platforms.pinai import pinai_polling_loop
+from platforms.fetchai import fetchai_polling_loop
+from platforms.webhook import normalize_webhook, detect_platform
 from payments.x402_middleware import verify_payment, build_payment_required_response
 from payments.wallet import get_wallet_address, get_balance
 from security.validators import validate_input, validate_output, sanitize_user_id
@@ -35,14 +38,21 @@ START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("nexus_starting", environment=settings.ENVIRONMENT)
-    pinai_task = asyncio.create_task(pinai_polling_loop())
-    log.info("pinai_task_launched")
+
+    # Launch all platform polling loops as background tasks
+    tasks = [
+        asyncio.create_task(pinai_polling_loop()),
+        asyncio.create_task(fetchai_polling_loop()),
+    ]
+    log.info("platform_tasks_launched", count=len(tasks))
+
     yield
-    pinai_task.cancel()
-    try:
-        await pinai_task
-    except asyncio.CancelledError:
-        log.info("pinai_task_stopped")
+
+    # Clean shutdown
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("platform_tasks_stopped")
 
 
 # ── APP ───────────────────────────────────────────────────────────────────────
@@ -50,7 +60,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NEXUS-thirdy",
     description="Server-native AI agent. No laptop required.",
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan
 )
 
@@ -76,29 +86,65 @@ class AgentSkillRequest(BaseModel):
     request_id: str = ""
 
 
-# ── DRIFT LOGGING ─────────────────────────────────────────────────────────────
+# ── CORE PROCESSING ───────────────────────────────────────────────────────────
 
-async def log_interaction(user_id: str, skill: str, platform: str, success: bool):
+async def process_chat(
+    user_id: str,
+    message: str,
+    platform: str,
+    payment_proof: str = ""
+) -> ChatResponse:
     """
-    Log every interaction to Supabase for behavioral drift monitoring.
-    Non-blocking — fire and forget.
-    Drift analysis runs weekly as a separate script (Phase 10).
+    Core processing function shared by all endpoints.
+    Validates input, runs LangGraph, validates output.
     """
-    if not settings.SUPABASE_URL:
-        return
+    user_id = sanitize_user_id(user_id)
+    validation = validate_input(message, user_id=user_id)
+
+    if not validation.is_valid:
+        return ChatResponse(
+            response="Your message couldn't be processed. Please try rephrasing.",
+            skill_used="blocked",
+            cost_usdc=0.0
+        )
+
+    initial_state = {
+        "user_id": user_id,
+        "platform": platform,
+        "raw_message": validation.sanitized or message.strip(),
+        "detected_skill": "",
+        "requires_payment": False,
+        "payment_verified": False,
+        "payment_proof": payment_proof,
+        "context_pack": "",
+        "llm_response": "",
+        "reasoning_trace": "",
+        "reflexion_score": 0.0,
+        "reflexion_iteration": 0,
+        "reflexion_critique": "",
+        "final_response": "",
+        "messages": []
+    }
 
     try:
-        from supabase import create_client
-        supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
-        supabase.table("nexus_interactions").insert({
-            "user_id": user_id,
-            "skill": skill,
-            "platform": platform,
-            "success": success,
-            "timestamp": time.time()
-        }).execute()
+        final_state = await nexus_graph.ainvoke(initial_state)
     except Exception as e:
-        log.error("drift_log_failed", error=str(e))
+        log.error("graph_error", user_id=user_id, platform=platform, error=str(e))
+        return ChatResponse(
+            response="I encountered an issue. Please try again.",
+            skill_used="error",
+            cost_usdc=0.0
+        )
+
+    skill_used = final_state.get("detected_skill", "unknown")
+    raw_response = final_state.get("final_response", "")
+    output_validation = validate_output(raw_response, skill_id=skill_used)
+    final_response = output_validation.sanitized or raw_response
+
+    skill_def = get_skill(skill_used)
+    cost = skill_def.price_usdc if skill_def and final_state.get("payment_verified") else 0.0
+
+    return ChatResponse(response=final_response, skill_used=skill_used, cost_usdc=cost)
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
@@ -114,25 +160,54 @@ async def status():
     counts = skill_count()
     return {
         "agent": "NEXUS-thirdy",
-        "version": "0.8.0",
-        "phase": "8 - security layer active",
+        "version": "0.9.0",
+        "phase": "9 - multi-platform deployment",
         "environment": settings.ENVIRONMENT,
         "uptime_seconds": int(time.time() - START_TIME),
         "skills": counts,
-        "llm_ready": settings.has_groq(),
-        "pinai_ready": settings.has_pinai(),
+        "platforms": {
+            "pinai": settings.has_pinai(),
+            "fetchai": settings.has_fetchai(),
+            "webhook": True,
+            "agenthub": True,
+            "mcp": True
+        },
+        "llm": {
+            "groq": settings.has_groq(),
+            "nvidia": settings.has_nvidia(),
+            "cerebras": settings.has_cerebras()
+        },
         "payments_ready": bool(settings.AGENT_WALLET_ADDRESS),
         "security": {
             "firewall": settings.LLAMAFIREWALL_ENABLED,
             "input_validation": True,
-            "output_validation": True,
-            "drift_logging": bool(settings.SUPABASE_URL)
+            "output_validation": True
         },
         "wallet": wallet_address or "not configured",
         "memory_ready": {
             "vector": bool(settings.SUPABASE_URL),
             "graph": bool(settings.GRAPHITI_NEO4J_URI)
         }
+    }
+
+
+@app.get("/platforms")
+async def platforms():
+    """Shows all platforms NEXUS-thirdy is connected to."""
+    return {
+        "active": [
+            p for p, active in {
+                "pinai": settings.has_pinai(),
+                "fetchai": settings.has_fetchai(),
+                "webhook": True,
+                "agenthub": True,
+                "mcp": True
+            }.items() if active
+        ],
+        "webhook_url": "https://nexus-thirdy.onrender.com/webhook",
+        "agent_url": "https://nexus-thirdy.onrender.com/agent",
+        "mcp_url": "https://nexus-thirdy.onrender.com/mcp",
+        "chat_url": "https://nexus-thirdy.onrender.com/chat",
     }
 
 
@@ -150,66 +225,49 @@ async def wallet_info():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Main chat endpoint with full security layer."""
+    return await process_chat(
+        user_id=req.user_id,
+        message=req.message,
+        platform=req.platform,
+        payment_proof=req.payment_proof or ""
+    )
 
-    # Sanitize user_id
-    user_id = sanitize_user_id(req.user_id)
 
-    # Input validation
-    validation = validate_input(req.message, user_id=user_id)
-    if not validation.is_valid:
-        raise HTTPException(status_code=400, detail=validation.reason)
-
-    initial_state = {
-        "user_id": user_id,
-        "platform": req.platform,
-        "raw_message": validation.sanitized or req.message.strip(),
-        "detected_skill": "",
-        "requires_payment": False,
-        "payment_verified": False,
-        "payment_proof": req.payment_proof or "",
-        "context_pack": "",
-        "llm_response": "",
-        "reasoning_trace": "",
-        "reflexion_score": 0.0,
-        "reflexion_iteration": 0,
-        "reflexion_critique": "",
-        "final_response": "",
-        "messages": []
-    }
-
+@app.post("/webhook")
+async def webhook(request: Request):
+    """
+    Multi-platform webhook endpoint.
+    Auto-detects platform and normalizes payload.
+    """
     try:
-        final_state = await nexus_graph.ainvoke(initial_state)
-    except Exception as e:
-        log.error("graph_error", user_id=user_id, error=str(e))
-        asyncio.create_task(log_interaction(user_id, "error", req.platform, False))
-        raise HTTPException(status_code=500, detail="Agent processing error")
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid_json"})
 
-    skill_used = final_state.get("detected_skill", "unknown")
-    raw_response = final_state.get("final_response", "")
+    headers = dict(request.headers)
+    platform = detect_platform(headers, body)
+    user_id, message = normalize_webhook(body, platform)
 
-    # Output validation
-    output_validation = validate_output(raw_response, skill_id=skill_used)
-    final_response = output_validation.sanitized or raw_response
+    if not message:
+        return {"status": "empty_message", "platform": platform}
 
-    # Log interaction for drift monitoring
-    asyncio.create_task(
-        log_interaction(user_id, skill_used, req.platform, True)
+    result = await process_chat(
+        user_id=user_id,
+        message=message,
+        platform=platform
     )
 
-    skill_def = get_skill(skill_used)
-    cost = skill_def.price_usdc if skill_def and final_state.get("payment_verified") else 0.0
-
-    return ChatResponse(
-        response=final_response,
-        skill_used=skill_used,
-        cost_usdc=cost
-    )
+    return {
+        "response": result.response,
+        "skill_used": result.skill_used,
+        "cost_usdc": result.cost_usdc,
+        "platform": platform
+    }
 
 
 @app.post("/agent")
 async def agent_skill_call(req: AgentSkillRequest, request: Request):
-    """AgentHub skill call endpoint."""
+    """AgentHub + A2A skill call endpoint."""
     skill_id = req.skill
     parameters = req.parameters
     request_id = req.request_id
@@ -217,17 +275,15 @@ async def agent_skill_call(req: AgentSkillRequest, request: Request):
     log.info("agent_skill_called", skill=skill_id, request_id=request_id)
 
     message = parameters.get("message", parameters.get("query", parameters.get("text", "")))
-    user_id = sanitize_user_id(parameters.get("user_id", f"agenthub_{request_id}"))
+    user_id = sanitize_user_id(parameters.get("user_id", f"agent_{request_id}"))
 
     if not message:
         return {"result": "No message provided.", "data": {}}
 
-    # Input validation
     validation = validate_input(message, user_id=user_id)
     if not validation.is_valid:
         return {"result": "Invalid input.", "data": {"reason": validation.reason}}
 
-    # Payment check for premium skills
     skill_def = get_skill(skill_id)
     if skill_def and skill_def.requires_payment:
         payment_proof = request.headers.get("X-Payment", "")
@@ -238,63 +294,95 @@ async def agent_skill_call(req: AgentSkillRequest, request: Request):
             user_address=user_id
         )
         if not is_paid:
-            payment_info = build_payment_required_response(skill_id, wallet)
-            return JSONResponse(status_code=402, content=payment_info)
+            return JSONResponse(
+                status_code=402,
+                content=build_payment_required_response(skill_id, wallet)
+            )
 
-    initial_state = {
-        "user_id": user_id,
-        "platform": "agenthub",
-        "raw_message": validation.sanitized or message,
-        "detected_skill": skill_id if skill_def else "",
-        "requires_payment": bool(skill_def and skill_def.requires_payment),
-        "payment_verified": True if (skill_def and not skill_def.requires_payment) else False,
-        "payment_proof": request.headers.get("X-Payment", ""),
-        "context_pack": "",
-        "llm_response": "",
-        "reasoning_trace": "",
-        "reflexion_score": 0.0,
-        "reflexion_iteration": 0,
-        "reflexion_critique": "",
-        "final_response": "",
-        "messages": []
+    result = await process_chat(
+        user_id=user_id,
+        message=validation.sanitized or message,
+        platform="agenthub",
+        payment_proof=request.headers.get("X-Payment", "")
+    )
+
+    return {
+        "result": result.response,
+        "data": {
+            "skill_used": result.skill_used,
+            "request_id": request_id,
+            "cost_usdc": result.cost_usdc
+        }
     }
 
-    try:
-        final_state = await nexus_graph.ainvoke(initial_state)
-        result = final_state.get("final_response", "")
 
-        # Output validation
-        output_validation = validate_output(result, skill_id=skill_id)
-        result = output_validation.sanitized or result
-
-        return {
-            "result": result,
-            "data": {
-                "skill_used": final_state.get("detected_skill", skill_id),
-                "request_id": request_id,
-                "reflexion_score": final_state.get("reflexion_score")
+@app.get("/mcp")
+async def mcp_manifest():
+    """
+    MCP (Model Context Protocol) server manifest.
+    Makes NEXUS-thirdy discoverable by any MCP-compatible agent or platform.
+    Claude, GPT, Gemini agents can all discover and call NEXUS-thirdy skills
+    through this endpoint.
+    """
+    from config.skill_registry import SKILL_REGISTRY
+    return {
+        "schema_version": "1.0",
+        "name": "NEXUS-thirdy",
+        "description": "AI agent with hybrid memory, crypto intelligence, and autonomous payments.",
+        "endpoint": "https://nexus-thirdy.onrender.com",
+        "tools": [
+            {
+                "name": skill.id,
+                "description": skill.description,
+                "price_usdc": skill.price_usdc,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Your query or request"
+                        }
+                    },
+                    "required": ["message"]
+                }
             }
+            for skill in SKILL_REGISTRY.values()
+        ],
+        "payment": {
+            "protocol": "x402",
+            "network": settings.X402_NETWORK,
+            "recipient": settings.AGENT_WALLET_ADDRESS or "not configured"
         }
-    except Exception as e:
-        log.error("agent_skill_error", skill=skill_id, error=str(e))
-        return {"result": "Error processing skill request.", "data": {"error": str(e)}}
+    }
 
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    """Generic webhook for all platforms."""
-    body = await request.json()
-    platform = request.headers.get("X-Platform", "webhook")
+@app.post("/mcp/call")
+async def mcp_call(request: Request):
+    """
+    MCP tool call endpoint.
+    Any MCP-compatible agent sends tool calls here.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid_json"})
 
-    if platform == "pinai":
-        user_id = body.get("from_agent_id", "unknown")
-        message = body.get("content", "")
-    else:
-        user_id = body.get("user_id", body.get("from", body.get("sender", "unknown")))
-        message = body.get("message", body.get("content", body.get("text", "")))
+    tool_name = body.get("name", "")
+    tool_input = body.get("input", {})
+    message = tool_input.get("message", "")
+    user_id = sanitize_user_id(body.get("caller_id", "mcp_caller"))
 
     if not message:
-        return {"status": "empty_message"}
+        return {"content": [{"type": "text", "text": "No message provided."}]}
 
-    req = ChatRequest(user_id=user_id, message=message, platform=platform)
-    return await chat(req)
+    result = await process_chat(
+        user_id=user_id,
+        message=message,
+        platform="mcp"
+    )
+
+    return {
+        "content": [{"type": "text", "text": result.response}],
+        "tool_used": result.skill_used,
+        "cost_usdc": result.cost_usdc
+    }
