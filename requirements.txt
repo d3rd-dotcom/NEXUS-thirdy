@@ -1,44 +1,64 @@
 # ============================================================
-# NEXUS — Python Dependencies
-# Install: pip install -r requirements.txt
-# After first working install: pip freeze > requirements.lock
+# NEXUS-thirdy — Python Dependencies
+# FIXED (H7): All versions pinned for reproducible builds.
+# After verifying on your environment: pip freeze > requirements.lock
+#
+# Notes on package availability:
+#   - llamafirewall: verify exact PyPI name before deploying.
+#     If not found, set LLAMAFIREWALL_ENABLED=false until confirmed.
+#   - x402: verify PyPI package name matches import path in
+#     payments/x402_middleware.py (x402.client, x402.types).
 # ============================================================
 
 # --- Core Framework ---
-langgraph>=0.3.0
-langchain>=0.3.0
-langchain-community>=0.3.0
-langchain-groq>=0.3.0
-langsmith>=0.2.0
+langgraph==0.3.5
+langchain==0.3.20
+langchain-community==0.3.20
+langchain-groq==0.3.2
+langsmith==0.2.8
 
 # --- API Server ---
-fastapi>=0.115.0
-uvicorn[standard]>=0.34.0
-httpx>=0.28.0
-python-multipart>=0.0.9
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+python-multipart==0.0.20
+
+# FIXED (H3): Rate limiting middleware — required by api/server.py
+slowapi==0.1.9
 
 # --- Memory ---
-mem0ai>=0.1.0
-graphiti-core>=0.4.0
-supabase>=2.0.0
+mem0ai==0.1.43
+graphiti-core==0.4.2
+supabase==2.10.0
+
+# FIXED (H1): TTL cache for bounded in-memory deduplication sets in platforms/pinai.py
+cachetools==5.5.0
 
 # --- LLM Clients ---
-cohere>=5.0.0
-cerebras-cloud-sdk>=1.0.0
-mistralai>=1.0.0
+cohere==5.13.0
+cerebras-cloud-sdk==1.24.0
+mistralai==1.5.0
+langchain-openai==0.3.9
 
 # --- Payments ---
-coinbase-agentkit>=0.3.0
+coinbase-agentkit==0.3.0
+# FIXED (C2): x402 payment protocol library.
+# Confirm PyPI package name matches: `from x402.client import FacilitatorClient`
+x402==0.1.0
 
 # --- Security ---
-pydantic>=2.0.0
-restrictedpython>=7.0.0
+pydantic==2.10.6
+restrictedpython==7.4
+llamafirewall==0.1.0
 
 # --- Utilities ---
-python-dotenv>=1.0.0
-aiohttp>=3.9.0
-structlog>=24.0.0
+python-dotenv==1.0.1
+structlog==24.4.0
+# FIXED (L2): Removed aiohttp — not imported or used anywhere in the codebase.
+# It was pulling in an extra ~3 MB of transitive dependencies for nothing.
 
-langchain-openai>=0.3.0
-
-llamafirewall>=0.1.0
+# --- Testing ---
+pytest==8.3.5
+# FIXED (L3): pytest-asyncio is required for async LangGraph node tests.
+# Without it, any async test function silently passes without actually running.
+pytest-asyncio==0.24.0

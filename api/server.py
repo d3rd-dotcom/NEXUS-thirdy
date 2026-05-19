@@ -1,13 +1,23 @@
 """
 NEXUS-thirdy | api/server.py
-Phase 9 — Multi-Platform Server
+Phase 9 — Multi-Platform FastAPI Server
 
-Changes from Phase 8:
-  - Fetch.AI polling loop added to lifespan
-  - Webhook adapter uses platform auto-detection
-  - MCP-compatible /mcp endpoint added
-  - /platforms endpoint shows all connected platforms
-  - Updated version to 0.9.0
+FIXED (H3): Rate limiting via slowapi — configurable per-IP per-minute limit
+            (default 20, set via RATE_LIMIT_PER_MINUTE env var). The `request`
+            parameter is required as the first arg on every rate-limited
+            endpoint — slowapi reads the client IP from it.
+
+FIXED (H4): CORS middleware added with a configurable origin allowlist from
+            settings.ALLOWED_ORIGINS. An empty list (the default) blocks all
+            cross-origin requests, which is the safest default for an API that
+            has no legitimate browser clients until explicitly configured.
+
+FIXED (C3, C4): process_chat() and agent_skill_call() now use
+                make_initial_state() to build the LangGraph initial state,
+                guaranteeing all 15 ThirdyState keys are always present.
+
+FIXED (H8): LANGCHAIN_TRACING_V2 defaults to false in settings.py — no
+            change needed here, the environment variable drives the SDK.
 """
 
 import time
@@ -16,11 +26,23 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # FIXED (H4)
 from pydantic import BaseModel
 
+# FIXED (H3): slowapi rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 from config.settings import settings
-from config.skill_registry import generate_skill_manifest, skill_count, get_skill
+from config.skill_registry import (
+    generate_skill_manifest,
+    skill_count,
+    get_skill,
+    SKILL_REGISTRY,
+)
 from agent.graph import nexus_graph
+from agent.state_factory import make_initial_state  # FIXED (C3, C4)
 from platforms.pinai import pinai_polling_loop
 from platforms.fetchai import fetchai_polling_loop
 from platforms.webhook import normalize_webhook, detect_platform
@@ -33,22 +55,23 @@ log = structlog.get_logger()
 START_TIME = time.time()
 
 
+# ── RATE LIMITER ──────────────────────────────────────────────────────────────
+# FIXED (H3): Instantiated before the app so decorators can reference it.
+# key_func=get_remote_address uses the client IP as the rate-limit bucket.
+limiter = Limiter(key_func=get_remote_address)
+
+
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("nexus_starting", environment=settings.ENVIRONMENT)
-
-    # Launch all platform polling loops as background tasks
     tasks = [
         asyncio.create_task(pinai_polling_loop()),
         asyncio.create_task(fetchai_polling_loop()),
     ]
     log.info("platform_tasks_launched", count=len(tasks))
-
     yield
-
-    # Clean shutdown
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -60,12 +83,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NEXUS-thirdy",
     description="Server-native AI agent. No laptop required.",
-    version="0.9.0",
-    lifespan=lifespan
+    version="0.9.1",
+    lifespan=lifespan,
+)
+
+# FIXED (H3): Register the rate-limit exception handler so slowapi returns
+# a proper 429 JSON response rather than an unhandled 500.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# FIXED (H4): CORS middleware with explicit allowlist.
+# settings.ALLOWED_ORIGINS is an empty list by default, which blocks all
+# cross-origin requests until the operator deliberately configures origins.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
-# ── MODELS ────────────────────────────────────────────────────────────────────
+# ── REQUEST / RESPONSE MODELS ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -92,39 +131,28 @@ async def process_chat(
     user_id: str,
     message: str,
     platform: str,
-    payment_proof: str = ""
+    payment_proof: str = "",
 ) -> ChatResponse:
     """
     Core processing function shared by all endpoints.
-    Validates input, runs LangGraph, validates output.
+
+    FIXED (C3, C4): Uses make_initial_state() — all 15 ThirdyState keys are
+    guaranteed present. The previous inline dict was missing payment_proof,
+    reasoning_trace, reflexion_score, reflexion_iteration, and
+    reflexion_critique, causing KeyError crashes in downstream nodes.
+
+    Note: callers that need to return an HTTP error on invalid input
+    (e.g. /chat) should validate BEFORE calling this function and raise
+    HTTPException themselves. This function is an internal workhorse that
+    trusts its inputs are pre-screened.
     """
-    user_id = sanitize_user_id(user_id)
-    validation = validate_input(message, user_id=user_id)
-
-    if not validation.is_valid:
-        return ChatResponse(
-            response="Your message couldn't be processed. Please try rephrasing.",
-            skill_used="blocked",
-            cost_usdc=0.0
-        )
-
-    initial_state = {
-        "user_id": user_id,
-        "platform": platform,
-        "raw_message": validation.sanitized or message.strip(),
-        "detected_skill": "",
-        "requires_payment": False,
-        "payment_verified": False,
-        "payment_proof": payment_proof,
-        "context_pack": "",
-        "llm_response": "",
-        "reasoning_trace": "",
-        "reflexion_score": 0.0,
-        "reflexion_iteration": 0,
-        "reflexion_critique": "",
-        "final_response": "",
-        "messages": []
-    }
+    # FIXED (C3, C4): Factory guarantees all ThirdyState keys are present
+    initial_state = make_initial_state(
+        user_id=user_id,
+        message=message,
+        platform=platform,
+        payment_proof=payment_proof,
+    )
 
     try:
         final_state = await nexus_graph.ainvoke(initial_state)
@@ -133,7 +161,7 @@ async def process_chat(
         return ChatResponse(
             response="I encountered an issue. Please try again.",
             skill_used="error",
-            cost_usdc=0.0
+            cost_usdc=0.0,
         )
 
     skill_used = final_state.get("detected_skill", "unknown")
@@ -142,9 +170,42 @@ async def process_chat(
     final_response = output_validation.sanitized or raw_response
 
     skill_def = get_skill(skill_used)
-    cost = skill_def.price_usdc if skill_def and final_state.get("payment_verified") else 0.0
+    cost = (
+        skill_def.price_usdc
+        if skill_def and final_state.get("payment_verified")
+        else 0.0
+    )
 
-    return ChatResponse(response=final_response, skill_used=skill_used, cost_usdc=cost)
+    return ChatResponse(
+        response=final_response,
+        skill_used=skill_used,
+        cost_usdc=cost,
+    )
+
+
+# ── DRIFT LOGGING ─────────────────────────────────────────────────────────────
+
+async def log_interaction(
+    user_id: str,
+    skill: str,
+    platform: str,
+    success: bool,
+) -> None:
+    """Write an interaction record to Supabase for the weekly audit."""
+    if not settings.SUPABASE_URL:
+        return
+    try:
+        from supabase import create_client
+        supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+        supabase.table("nexus_interactions").insert({
+            "user_id": user_id,
+            "skill": skill,
+            "platform": platform,
+            "success": success,
+            "timestamp": time.time(),
+        }).execute()
+    except Exception as e:
+        log.error("drift_log_failed", error=str(e))
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
@@ -160,7 +221,7 @@ async def status():
     counts = skill_count()
     return {
         "agent": "NEXUS-thirdy",
-        "version": "0.9.0",
+        "version": "0.9.1",
         "phase": "9 - multi-platform deployment",
         "environment": settings.ENVIRONMENT,
         "uptime_seconds": int(time.time() - START_TIME),
@@ -170,30 +231,32 @@ async def status():
             "fetchai": settings.has_fetchai(),
             "webhook": True,
             "agenthub": True,
-            "mcp": True
+            "mcp": True,
         },
         "llm": {
             "groq": settings.has_groq(),
             "nvidia": settings.has_nvidia(),
-            "cerebras": settings.has_cerebras()
+            "cerebras": settings.has_cerebras(),
         },
         "payments_ready": bool(settings.AGENT_WALLET_ADDRESS),
+        "payment_verification": settings.X402_VERIFY_PAYMENTS,
         "security": {
             "firewall": settings.LLAMAFIREWALL_ENABLED,
             "input_validation": True,
-            "output_validation": True
+            "output_validation": True,
+            "rate_limit_per_minute": settings.RATE_LIMIT_PER_MINUTE,
+            "cors_origins_configured": len(settings.ALLOWED_ORIGINS),
         },
         "wallet": wallet_address or "not configured",
         "memory_ready": {
-            "vector": bool(settings.SUPABASE_URL),
-            "graph": bool(settings.GRAPHITI_NEO4J_URI)
-        }
+            "vector": bool(settings.SUPABASE_URL and settings.SUPABASE_PROJECT_REF),
+            "graph": bool(settings.GRAPHITI_NEO4J_URI),
+        },
     }
 
 
 @app.get("/platforms")
 async def platforms():
-    """Shows all platforms NEXUS-thirdy is connected to."""
     return {
         "active": [
             p for p, active in {
@@ -201,8 +264,9 @@ async def platforms():
                 "fetchai": settings.has_fetchai(),
                 "webhook": True,
                 "agenthub": True,
-                "mcp": True
-            }.items() if active
+                "mcp": True,
+            }.items()
+            if active
         ],
         "webhook_url": "https://nexus-thirdy.onrender.com/webhook",
         "agent_url": "https://nexus-thirdy.onrender.com/agent",
@@ -220,24 +284,53 @@ async def skill_manifest():
 async def wallet_info():
     address = await get_wallet_address()
     balance = await get_balance()
-    return {"address": address, "balance": balance, "network": settings.X402_NETWORK}
+    return {
+        "address": address,
+        "balance": balance,
+        "network": settings.X402_NETWORK,
+    }
 
+
+# ── RATE-LIMITED ENDPOINTS ────────────────────────────────────────────────────
+# FIXED (H3): `request: Request` MUST be the first parameter on every
+# rate-limited endpoint — slowapi reads the client IP from it.
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    return await process_chat(
-        user_id=req.user_id,
-        message=req.message,
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
+async def chat(request: Request, req: ChatRequest):
+    """
+    Main chat endpoint. Returns 400 for empty or invalid input, 429 when the
+    per-IP rate limit is exceeded, and a ChatResponse on success.
+    """
+    user_id = sanitize_user_id(req.user_id)
+    validation = validate_input(req.message, user_id=user_id)
+
+    if not validation.is_valid:
+        # FIXED: Return 400 rather than silently returning a blocked ChatResponse.
+        # This is the correct HTTP behaviour for a malformed client request and
+        # also what the test suite asserts.
+        raise HTTPException(status_code=400, detail=validation.reason)
+
+    result = await process_chat(
+        user_id=user_id,
+        message=validation.sanitized or req.message,
         platform=req.platform,
-        payment_proof=req.payment_proof or ""
+        payment_proof=req.payment_proof or "",
     )
+
+    asyncio.create_task(
+        log_interaction(user_id, result.skill_used, req.platform, True)
+    )
+    return result
 
 
 @app.post("/webhook")
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
 async def webhook(request: Request):
     """
-    Multi-platform webhook endpoint.
-    Auto-detects platform and normalizes payload.
+    Multi-platform webhook endpoint with automatic platform detection.
+    Normalizes payloads from MindStudio, toku, Zapier, PIN AI, Fetch.AI,
+    and generic REST integrations.
     """
     try:
         body = await request.json()
@@ -254,27 +347,34 @@ async def webhook(request: Request):
     result = await process_chat(
         user_id=user_id,
         message=message,
-        platform=platform
+        platform=platform,
     )
 
     return {
         "response": result.response,
         "skill_used": result.skill_used,
         "cost_usdc": result.cost_usdc,
-        "platform": platform
+        "platform": platform,
     }
 
 
 @app.post("/agent")
-async def agent_skill_call(req: AgentSkillRequest, request: Request):
-    """AgentHub + A2A skill call endpoint."""
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
+async def agent_skill_call(request: Request, req: AgentSkillRequest):
+    """
+    AgentHub + A2A (agent-to-agent) skill call endpoint.
+    Supports x402 payment via the X-Payment request header.
+    """
     skill_id = req.skill
     parameters = req.parameters
     request_id = req.request_id
 
     log.info("agent_skill_called", skill=skill_id, request_id=request_id)
 
-    message = parameters.get("message", parameters.get("query", parameters.get("text", "")))
+    message = parameters.get(
+        "message",
+        parameters.get("query", parameters.get("text", "")),
+    )
     user_id = sanitize_user_id(parameters.get("user_id", f"agent_{request_id}"))
 
     if not message:
@@ -284,6 +384,7 @@ async def agent_skill_call(req: AgentSkillRequest, request: Request):
     if not validation.is_valid:
         return {"result": "Invalid input.", "data": {"reason": validation.reason}}
 
+    # Payment gate for premium skills called via the agent endpoint
     skill_def = get_skill(skill_id)
     if skill_def and skill_def.requires_payment:
         payment_proof = request.headers.get("X-Payment", "")
@@ -291,19 +392,20 @@ async def agent_skill_call(req: AgentSkillRequest, request: Request):
         is_paid, reason = await verify_payment(
             skill_id=skill_id,
             payment_proof=payment_proof,
-            user_address=user_id
+            user_address=user_id,
         )
         if not is_paid:
             return JSONResponse(
                 status_code=402,
-                content=build_payment_required_response(skill_id, wallet)
+                content=build_payment_required_response(skill_id, wallet),
             )
 
+    # FIXED (C3, C4): make_initial_state() via process_chat()
     result = await process_chat(
         user_id=user_id,
         message=validation.sanitized or message,
         platform="agenthub",
-        payment_proof=request.headers.get("X-Payment", "")
+        payment_proof=request.headers.get("X-Payment", ""),
     )
 
     return {
@@ -311,8 +413,8 @@ async def agent_skill_call(req: AgentSkillRequest, request: Request):
         "data": {
             "skill_used": result.skill_used,
             "request_id": request_id,
-            "cost_usdc": result.cost_usdc
-        }
+            "cost_usdc": result.cost_usdc,
+        },
     }
 
 
@@ -321,14 +423,14 @@ async def mcp_manifest():
     """
     MCP (Model Context Protocol) server manifest.
     Makes NEXUS-thirdy discoverable by any MCP-compatible agent or platform.
-    Claude, GPT, Gemini agents can all discover and call NEXUS-thirdy skills
-    through this endpoint.
     """
-    from config.skill_registry import SKILL_REGISTRY
     return {
         "schema_version": "1.0",
         "name": "NEXUS-thirdy",
-        "description": "AI agent with hybrid memory, crypto intelligence, and autonomous payments.",
+        "description": (
+            "AI agent with hybrid memory, crypto intelligence, "
+            "and autonomous payments."
+        ),
         "endpoint": "https://nexus-thirdy.onrender.com",
         "tools": [
             {
@@ -340,34 +442,31 @@ async def mcp_manifest():
                     "properties": {
                         "message": {
                             "type": "string",
-                            "description": "Your query or request"
+                            "description": "Your query or request",
                         }
                     },
-                    "required": ["message"]
-                }
+                    "required": ["message"],
+                },
             }
             for skill in SKILL_REGISTRY.values()
         ],
         "payment": {
             "protocol": "x402",
             "network": settings.X402_NETWORK,
-            "recipient": settings.AGENT_WALLET_ADDRESS or "not configured"
-        }
+            "recipient": settings.AGENT_WALLET_ADDRESS or "not configured",
+        },
     }
 
 
 @app.post("/mcp/call")
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
 async def mcp_call(request: Request):
-    """
-    MCP tool call endpoint.
-    Any MCP-compatible agent sends tool calls here.
-    """
+    """MCP tool call endpoint — accepts calls from any MCP-compatible agent."""
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid_json"})
 
-    tool_name = body.get("name", "")
     tool_input = body.get("input", {})
     message = tool_input.get("message", "")
     user_id = sanitize_user_id(body.get("caller_id", "mcp_caller"))
@@ -378,11 +477,11 @@ async def mcp_call(request: Request):
     result = await process_chat(
         user_id=user_id,
         message=message,
-        platform="mcp"
+        platform="mcp",
     )
 
     return {
         "content": [{"type": "text", "text": result.response}],
         "tool_used": result.skill_used,
-        "cost_usdc": result.cost_usdc
+        "cost_usdc": result.cost_usdc,
     }
