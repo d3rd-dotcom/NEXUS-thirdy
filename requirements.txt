@@ -41,9 +41,9 @@ mistralai==1.5.0
 langchain-openai==0.3.9
 
 # --- Payments ---
-coinbase-agentkit==0.3.0
-# FIXED (C2): x402 payment protocol library.
-# Confirm PyPI package name matches: `from x402.client import FacilitatorClient`
+# coinbase-agentkit removed: incompatible with x402 via allora-sdk pydantic-core conflict.
+# payments/wallet.py handles missing import gracefully (returns None).
+# Re-add when CDP credentials are configured and conflict is resolved upstream.
 x402==0.1.1
 
 # --- Security ---
