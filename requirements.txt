@@ -12,15 +12,15 @@
 
 # --- Core Framework ---
 langgraph==0.3.5
-langchain==0.3.20
+langchain==0.3.21
 langchain-community==0.3.20
 langchain-groq==0.3.2
 langsmith==0.2.8
 
 # --- API Server ---
-fastapi==0.115.6
+fastapi==0.115.12
 uvicorn[standard]==0.34.0
-httpx==0.28.1
+httpx==0.27.2
 python-multipart==0.0.20
 
 # FIXED (H3): Rate limiting middleware — required by api/server.py
@@ -44,10 +44,10 @@ langchain-openai==0.3.9
 coinbase-agentkit==0.3.0
 # FIXED (C2): x402 payment protocol library.
 # Confirm PyPI package name matches: `from x402.client import FacilitatorClient`
-x402==0.1.0
+x402==0.1.1
 
 # --- Security ---
-pydantic==2.10.6
+pydantic==2.11.4
 restrictedpython==7.4
 llamafirewall==0.1.0
 
