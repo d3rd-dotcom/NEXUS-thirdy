@@ -163,7 +163,3 @@ Once deployed, your agent is available at:
 | `GET  /platforms` | Connected platform list |
 
 ---
-
-## Built by
-
-Leonardo Amora III ([@thirdy12356](https://x.com/thirdy12356))
